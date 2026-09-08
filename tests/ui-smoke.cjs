@@ -1,5 +1,5 @@
 // Optional: NODE_PATH=/path/to/node_modules node tests/ui-smoke.cjs
-// Exercises actual page JS against the real demo HTTP API in jsdom, not a visual browser.
+// Executes the shipped HTML/JS against the real demo HTTP API, not mock responses.
 const {JSDOM,VirtualConsole}=require('jsdom');
 const {spawn}=require('node:child_process');const fs=require('node:fs');const os=require('node:os');const net=require('node:net');const assert=require('node:assert/strict');
 const wait=async fn=>{for(let i=0;i<100;i++){if(await fn())return;await new Promise(r=>setTimeout(r,50))}throw Error('Timed out')};
@@ -11,22 +11,25 @@ const wait=async fn=>{for(let i=0;i<100;i++){if(await fn())return;await new Prom
  try{
   await wait(async()=>{try{return (await fetch(base+'/healthz')).ok}catch{return false}});
   const html=await (await fetch(base)).text();const failures=[];const vc=new VirtualConsole();vc.on('jsdomError',e=>failures.push(e.message));
-  dom=new JSDOM(html,{url:base,runScripts:'dangerously',virtualConsole:vc,beforeParse(w){
-   w.confirm=()=>true;w.prompt=()=>null;w.HTMLElement.prototype.scrollIntoView=()=>{};
+  dom=new JSDOM(html,{url:base,runScripts:'dangerously',resources:'usable',virtualConsole:vc,beforeParse(w){
+   w.confirm=w.prompt=w.alert=()=>{throw Error('Native browser dialog must not be used')};
    w.fetch=async(path,opts={})=>{const headers={...(opts.headers||{})};const cookie=dom.cookieJar.getCookieStringSync(base);if(cookie)headers.Cookie=cookie;const r=await fetch(new URL(path,base),{...opts,headers});for(const c of r.headers.getSetCookie())dom.cookieJar.setCookieSync(c,base);return r};
   }});
-  const doc=dom.window.document;await wait(()=>!doc.querySelector('#password').disabled);
+  const doc=dom.window.document;await wait(()=>doc.querySelector('#loginForm').onsubmit);
   doc.querySelector('#password').value='test-ui-password-123456';doc.querySelector('#loginForm').dispatchEvent(new dom.window.Event('submit',{bubbles:true,cancelable:true}));
   await wait(()=>!doc.querySelector('#dashboard').classList.contains('hidden')&&doc.querySelectorAll('#deviceRows tr').length===1);
-  doc.querySelector('#deviceName').value='گوشی آزمایش';doc.querySelector('#deviceForm').dispatchEvent(new dom.window.Event('submit',{bubbles:true,cancelable:true}));
+  doc.querySelector('#tab-devices').click();doc.querySelector('.add-device').click();
+  doc.querySelector('#editName').value='گوشی آزمایش';doc.querySelector('#modalForm').dispatchEvent(new dom.window.Event('submit',{bubbles:true,cancelable:true}));
   await wait(()=>doc.querySelectorAll('#deviceRows tr').length===2);
-  const row=Array.from(doc.querySelectorAll('#deviceRows tr')).find(r=>r.textContent.includes('گوشی آزمایش'));assert.ok(row);
-  row.querySelector('button').click();await wait(()=>doc.querySelector('#link').value.startsWith('vless://'));
+  const row=Array.from(doc.querySelectorAll('#deviceRows tr')).find(r=>r.textContent.includes('گوشی آزمایش'));assert.ok(row.querySelector('[role=progressbar]'));
+  row.querySelector('.link-button').click();await wait(()=>doc.querySelector('#link')?.value.startsWith('vless://'));
+  const link=doc.querySelector('#link').value;doc.querySelector('#modalCancel').click();
+  const baseline=dom.window.buildClientConfig(link,{port:10818,mux:false,fragment:false,concurrency:8});
+  assert.equal(baseline.outbounds[0].mux.enabled,false);assert.equal(baseline.outbounds[0].streamSettings.tlsSettings.allowInsecure,false);assert.equal(baseline.inbounds[0].listen,'127.0.0.1');
+  assert.throws(()=>dom.window.buildClientConfig(link,{port:10818,fragment:true,length:'bad',interval:'1-3'}));
   assert.equal(doc.querySelectorAll('#profiles .profile').length,3);
-  assert.match(doc.querySelector('#historyRows').textContent,/هنوز اتصال/);
+  doc.querySelector('#tab-online').click();assert.equal(doc.querySelector('#tab-online').getAttribute('aria-selected'),'true');
   assert.equal(failures.length,0,failures.join('\n'));
-  console.log('PASS: login, devices, generated link, profiles, empty truthful history; actual JS + HTTP API');
- } finally {
-  if(dom)dom.window.close();proc.kill();await new Promise(r=>proc.once('exit',r));fs.rmSync(root,{recursive:true,force:true});
- }
+  console.log('PASS: shipped JS + HTTP, login, modal device creation, progress, link, client JSON defaults/validation, online tab; no native dialogs');
+ } finally {if(dom)dom.window.close();proc.kill();await new Promise(r=>proc.once('exit',r));fs.rmSync(root,{recursive:true,force:true})}
 })().catch(e=>{console.error(e);process.exitCode=1});

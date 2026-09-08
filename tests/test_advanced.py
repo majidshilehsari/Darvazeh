@@ -73,7 +73,7 @@ class AdvancedAPI(unittest.TestCase):
             self.assertEqual(req('/api/devices',{'name':'my phone'},cookie)[0],403)
             self.assertEqual(req('/api/devices',{'name':'my phone'},cookie,csrf)[0],200)
             value=json.loads((data/'settings.json').read_text()); self.assertEqual(value['uuid'],legacy)
-            self.assertEqual(json.loads((data/'backups/settings-before-0.2.0.json').read_text())['uuid'],legacy)
+            self.assertEqual(json.loads((data/'backups/settings-before-0.3.0.json').read_text())['uuid'],legacy)
             new=value['devices'][0]; self.assertNotEqual(new['uuid'],legacy)
             public=req('/api/devices',cookie=cookie)[1]; self.assertNotIn(new['uuid'],public); self.assertNotIn(legacy,public)
             link=req('/api/link?device='+new['id'],cookie=cookie); self.assertIn(new['uuid'],link[1])

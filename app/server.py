@@ -9,7 +9,7 @@ DATA = Path(os.getenv('DATA_DIR', '/data'))
 PASSWORD = os.environ.get('ADMIN_PASSWORD', '')
 DOMAIN = os.environ.get('PUBLIC_DOMAIN', '').strip()
 DEMO = os.getenv('DEMO_MODE') == '1'
-VERSION = '0.2.0-preview.1'
+VERSION = '0.3.0-preview.1'
 ENV_ERRORS = []
 if not PASSWORD:
     ENV_ERRORS.append('ADMIN_PASSWORD_MISSING')
@@ -83,7 +83,8 @@ def device_records(value=None):
     value = settings if value is None else value
     if value is None: return []
     return [{'id':'legacy', 'name':value.get('legacy_name','اتصال قبلی'),
-             'uuid':value['uuid'], 'enabled':value.get('legacy_enabled',True), 'legacy':True}] + value.get('devices',[])
+             'uuid':value['uuid'], 'enabled':value.get('legacy_enabled',True), 'legacy':True,
+             'quota_bytes':value.get('legacy_quota_bytes',0),'duration_days':value.get('legacy_duration_days',0)}] + value.get('devices',[])
 
 def validate_devices(value):
     import uuid
@@ -93,16 +94,41 @@ def validate_devices(value):
     for d in entries:
         if not isinstance(d['id'],str) or not isinstance(d['name'],str) or not 1<=len(d['name'])<=80 or type(d['enabled']) is not bool:
             raise ValueError('دستگاه نامعتبر')
+        validate_limits(d)
         key=str(uuid.UUID(d['uuid']))
         if d['id'] in seen_ids or key in seen_keys: raise ValueError('شناسه تکراری')
         seen_ids.add(d['id']); seen_keys.add(key)
 
+def validate_limits(d):
+    for key,maximum in (('quota_bytes',10**15),('duration_days',36500)):
+        value=d.get(key,0)
+        if type(value) is not int or not 0<=value<=maximum: raise ValueError('محدودیت حجم یا زمان نامعتبر است')
+
+def constrained(d):
+    return bool(d.get('quota_bytes',0) or d.get('duration_days',0))
+
+def device_policies():
+    return {d['id']:d for d in device_records()}
+
+def core_eligible(d):
+    # Monitor bypass is never an unlimited back door for a capped credential.
+    return d['enabled'] and (not constrained(d) or (MONITOR_ENABLED and HISTORY is not None))
+
+def device_state(d):
+    if HISTORY:
+        try: result=HISTORY.entitlement(d['id'],d)
+        except Exception: result={'reason':'meter-unavailable','used_bytes':None,'first_seen':None,'expires_at':None,'remaining_bytes':None,'basis':'unavailable'}
+    else: result={'reason':'meter-unavailable' if constrained(d) else None,'used_bytes':None,'first_seen':None,'expires_at':None,'remaining_bytes':None,'basis':'unavailable'}
+    if not d['enabled']: result['reason']='disabled'
+    elif constrained(d) and not MONITOR_ENABLED: result['reason']='monitor-disabled'
+    return result
+
 def device_map():
     import uuid
-    return {str(uuid.UUID(d['uuid'])):d['id'] for d in device_records() if d['enabled']}
+    return {str(uuid.UUID(d['uuid'])):d['id'] for d in device_records() if core_eligible(d)}
 
 def public_devices():
-    return [{k:v for k,v in d.items() if k!='uuid'} for d in device_records()]
+    return [{**{k:v for k,v in d.items() if k!='uuid'},'quota_bytes':d.get('quota_bytes',0),'duration_days':d.get('duration_days',0),**device_state(d)} for d in device_records()]
 
 def make_link(d):
     q=urllib.parse.urlencode({'encryption':'none','security':'tls','sni':DOMAIN,'type':'ws','host':DOMAIN,'path':'/connect','fp':'chrome'})
@@ -132,7 +158,7 @@ def profiles():
 def config(s):
     return {'log': {'loglevel': s['loglevel'], 'access': 'none'},
         'inbounds': [{'listen': '127.0.0.1', 'port': 10000, 'protocol': 'vless',
-          'settings': {'clients': [{'id': d['uuid'], 'email': d['id']+'@darvazeh.local'} for d in device_records(s) if d['enabled']], 'decryption': 'none'},
+          'settings': {'clients': [{'id': d['uuid'], 'email': d['id']+'@darvazeh.local'} for d in device_records(s) if core_eligible(d)], 'decryption': 'none'},
           'streamSettings': {'network': 'ws', 'security': 'none', 'wsSettings': {'path': '/connect'}}}],
         'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}, {'protocol': 'blackhole', 'tag': 'blocked'}],
         'routing': {'domainStrategy': 'IPIfNonMatch', 'rules': [{'type': 'field', 'ip': ['geoip:private'], 'outboundTag': 'blocked'}]}}
@@ -153,7 +179,7 @@ def apply(s):
         validate_devices(s)
         previous = json.loads(json.dumps(settings))
         # Additive backup: never replace an existing pre-upgrade snapshot.
-        backup = DATA / 'backups' / 'settings-before-0.2.0.json'
+        backup = DATA / 'backups' / 'settings-before-0.3.0.json'
         if SETTINGS.exists() and not backup.exists():
             backup.parent.mkdir(mode=0o700,exist_ok=True)
             with backup.open('x') as f:
@@ -207,11 +233,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/api/bootstrap': return self.reply(200, bootstrap())
         if self.path == '/healthz': return self.reply(200, {'panel': 'ok'})
-        if self.path == '/':
-            raw = Path(__file__).with_name('index.html').read_bytes()
-            self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8')
+        if self.path in ('/', '/style.css', '/app.js'):
+            filename={'/':'index.html','/style.css':'style.css','/app.js':'app.js'}[self.path]
+            raw = Path(__file__).with_name(filename).read_bytes()
+            self.send_response(200); self.send_header('Content-Type',{'/':'text/html; charset=utf-8','/style.css':'text/css; charset=utf-8','/app.js':'application/javascript; charset=utf-8'}[self.path])
             self.send_header('Cache-Control','no-store'); self.send_header('X-Frame-Options','DENY')
-            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'")
+            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'")
             self.end_headers(); self.wfile.write(raw); return
         sid,s = self.session()
         if not s: return self.reply(401, {'error':'ابتدا وارد شوید'})
@@ -239,6 +266,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(503, {'error':'واسط پایش آماده نیست؛ وضعیت پایش یا MONITOR_ENABLED را بررسی کنید'})
             chosen=next((d for d in device_records() if d['id']==query.get('device',['legacy'])[0]),None)
             if not chosen or not chosen['enabled']: return self.reply(404, {'error':'دستگاه فعال پیدا نشد'})
+            if device_state(chosen)['reason']:
+                return self.reply(409, {'error':'دستگاه به علت سهمیه، انقضا یا نبود پایش مجاز به اتصال نیست'})
             return self.reply(200, {'link':make_link(chosen)})
         return self.reply(404, {'error':'یافت نشد'})
     def do_POST(self):
@@ -288,25 +317,36 @@ class Handler(BaseHTTPRequestHandler):
                     if len(device_records())>=50: return self.reply(400, {'error':'حداکثر ۵۰ دستگاه مجاز است'})
                     import uuid
                     new=json.loads(json.dumps(settings))
-                    new.setdefault('devices',[]).append({'id':uuid.uuid4().hex,'uuid':str(uuid.uuid4()),'name':name.strip(),'enabled':True})
+                    limits={'quota_bytes':body.get('quota_bytes',0),'duration_days':body.get('duration_days',0)}
+                    try: validate_limits(limits)
+                    except ValueError as exc: return self.reply(400, {'error':str(exc)})
+                    if constrained(limits) and (not MONITOR_ENABLED or HISTORY is None):
+                        return self.reply(409, {'error':'ساخت دستگاه محدود نیازمند پایش روشن و دیتابیس سالم است'})
+                    new.setdefault('devices',[]).append({'id':uuid.uuid4().hex,'uuid':str(uuid.uuid4()),'name':name.strip(),'enabled':True,**limits})
                     apply(new)
                 elif self.path == '/api/device':
                     ident=body.get('id'); operation=body.get('operation')
                     new=json.loads(json.dumps(settings))
                     d=next((d for d in device_records(new) if d['id']==ident),None)
-                    if not d or operation not in ('enable','disable','rename','rotate'):
+                    if not d or operation not in ('enable','disable','rename','rotate','edit'):
                         return self.reply(400, {'error':'عملیات یا دستگاه نامعتبر'})
-                    if operation=='rename':
+                    if operation in ('rename','edit'):
                         name=body.get('name','')
                         if not isinstance(name,str) or not 1<=len(name.strip())<=80 or any(ord(c)<32 for c in name):
                             return self.reply(400, {'error':'نام نامعتبر'})
                         d['name']=name.strip()
+                        if operation=='edit':
+                            d.update(quota_bytes=body.get('quota_bytes',0),duration_days=body.get('duration_days',0))
+                            try: validate_limits(d)
+                            except ValueError as exc: return self.reply(400, {'error':str(exc)})
+                            if constrained(d) and (not MONITOR_ENABLED or HISTORY is None):
+                                return self.reply(409, {'error':'اعمال محدودیت نیازمند پایش روشن و دیتابیس سالم است'})
                     elif operation=='rotate':
                         import uuid
                         d['uuid']=str(uuid.uuid4())
                     else: d['enabled']=operation=='enable'
                     if ident=='legacy':
-                        new.update(uuid=d['uuid'],legacy_name=d['name'],legacy_enabled=d['enabled'])
+                        new.update(uuid=d['uuid'],legacy_name=d['name'],legacy_enabled=d['enabled'],legacy_quota_bytes=d.get('quota_bytes',0),legacy_duration_days=d.get('duration_days',0))
                     else:
                         new['devices']=[d if item['id']==ident else item for item in new['devices']]
                     apply(new)
@@ -345,7 +385,7 @@ if __name__ == '__main__':
                 except Exception: HISTORY_ERROR='HISTORY_STORAGE_FAILED'; event('error',HISTORY_ERROR)
                 if not DEMO and MONITOR_ENABLED:
                     try:
-                        RELAY=Relay(HISTORY,device_map,os.getenv('TRUSTED_PROXY_CIDRS',''),str(DATA/'GeoLite2-Country.mmdb'))
+                        RELAY=Relay(HISTORY,device_map,os.getenv('TRUSTED_PROXY_CIDRS',''),str(DATA/'GeoLite2-Country.mmdb'),policies=device_policies)
                         RELAY.start()
                     except Exception: HISTORY_ERROR='MONITOR_TRUST_CONFIG_INVALID'; event('error',HISTORY_ERROR)
                 try: apply(settings.copy())
