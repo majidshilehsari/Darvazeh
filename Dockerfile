@@ -1,7 +1,7 @@
 FROM debian:bookworm-slim
 ENV XRAY_VERSION=26.3.27
 ARG TARGETARCH=amd64
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl unzip nginx python3 tini && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl unzip nginx python3 python3-maxminddb tini && rm -rf /var/lib/apt/lists/*
 RUN case "$TARGETARCH" in amd64) ARCH=64; SHA=23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae ;; arm64) ARCH=arm64-v8a; SHA=4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c ;; *) exit 1 ;; esac && \
     curl -fL --retry 3 "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-${ARCH}.zip" -o /tmp/xray.zip && \
     echo "$SHA  /tmp/xray.zip" | sha256sum -c - && \
