@@ -14,12 +14,14 @@ const wait=async fn=>{for(let i=0;i<100;i++){if(await fn())return;await new Prom
   page.on('pageerror',e=>errors.push(e.message));page.on('dialog',async d=>{errors.push('Unexpected native dialog: '+d.type());await d.dismiss()});
   await page.goto(base);await page.locator('#password').fill('test-ui-password-123456');await page.locator('#loginForm button').click();await page.locator('#dashboard').waitFor({state:'visible'});
   await page.locator('#tab-devices').click();await page.locator('.add-device').click();await page.locator('#modal').waitFor({state:'visible'});
-  await page.locator('#editName').fill('گوشی آزمایش');await page.locator('#modalSubmit').click();await page.locator('#modal').waitFor({state:'hidden'});
+  await page.locator('#editName').fill('گوشی آزمایش');await page.locator('#modalSubmit').click();await page.locator('.qr-image').waitFor();
+  await page.screenshot({path:'/tmp/darvazeh-qr-desktop.png',fullPage:true});const qrshot=await page.locator('.qr-image').screenshot();const png=require('pngjs').PNG.sync.read(qrshot);const decoded=require('jsqr')(new Uint8ClampedArray(png.data),png.width,png.height);assert.equal(decoded.data,await page.locator('#link').inputValue());
+  const qrDownload=page.waitForEvent('download');await page.getByRole('button',{name:'دانلود تصویر QR',exact:true}).click();const qrFile=await qrDownload;assert.match(fs.readFileSync(await qrFile.path(),'utf8'),/<svg/);await page.locator('#modalCancel').click();
   await page.locator('#deviceRows tr').filter({hasText:'گوشی آزمایش'}).waitFor();
   assert.equal(await page.locator('#deviceRows [role=progressbar]').count(),1);
   const row=page.locator('#deviceRows tr').filter({hasText:'گوشی آزمایش'});
-  await row.locator('.more-button').click();await page.getByRole('button',{name:'ویرایش نام، سهمیه و اعتبار',exact:true}).click();
-  assert.equal(await page.locator('#editDays').inputValue(),'10');assert.equal(await page.locator('#editQuota').inputValue(),'5');
+  assert.match(await row.locator('.meter-percent').textContent(),/٪ مصرف‌شده/);await row.locator('.qr-button').click();await page.locator('.qr-image').waitFor();await page.locator('#modalCancel').click();await row.locator('.more-button').click();await page.getByRole('button',{name:'ویرایش نام، سهمیه و اعتبار',exact:true}).click();
+  assert.match(await page.locator('#expiryPreview').textContent(),/تخمینی/);assert.equal(await page.locator('#editDays').inputValue(),'10');assert.equal(await page.locator('#editQuota').inputValue(),'5');
   await page.locator('#editName').fill('گوشی شخصی');await page.locator('#editQuota').fill('8');await page.locator('#modalSubmit').click();await page.locator('#modal').waitFor({state:'hidden'});
   await page.locator('#deviceRows tr').filter({hasText:'گوشی شخصی'}).waitFor();
   await page.locator('#deviceSearch').fill('نامی که نیست');await page.locator('#deviceRows .empty').waitFor();await page.locator('#deviceSearch').fill('');
@@ -34,6 +36,6 @@ const wait=async fn=>{for(let i=0;i<100;i++){if(await fn())return;await new Prom
   await page.setViewportSize({width:390,height:844});await page.screenshot({path:'/tmp/darvazeh-mobile.png',fullPage:true});
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1),'Page overflow on mobile');
   assert.equal(errors.length,0,errors.join('\n'));
-  console.log('PASS: real Chromium, login, tabs, modal create/edit/cancel, quota progress, search, link, client JSON, desktop/mobile overflow; zero JS errors/native dialogs');
+  console.log('PASS: real Chromium, login, tabs, modal create/edit/cancel, quota percentages, QR decode/download/creation, expiry preview, search, link, client JSON, desktop/mobile overflow; zero JS errors/native dialogs');
  }finally{if(browser)await browser.close();proc.kill();await new Promise(r=>proc.once('exit',r));fs.rmSync(root,{recursive:true,force:true})}
 })().catch(e=>{console.error(e);process.exitCode=1});

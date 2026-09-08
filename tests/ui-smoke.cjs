@@ -19,15 +19,24 @@ const wait=async fn=>{for(let i=0;i<100;i++){if(await fn())return;await new Prom
   doc.querySelector('#password').value='test-ui-password-123456';doc.querySelector('#loginForm').dispatchEvent(new dom.window.Event('submit',{bubbles:true,cancelable:true}));
   await wait(()=>!doc.querySelector('#dashboard').classList.contains('hidden')&&doc.querySelectorAll('#deviceRows tr').length===1);
   doc.querySelector('#tab-devices').click();doc.querySelector('.add-device').click();
-  doc.querySelector('#editName').value='گوشی آزمایش';doc.querySelector('#modalForm').dispatchEvent(new dom.window.Event('submit',{bubbles:true,cancelable:true}));
+  assert.match(doc.querySelector('#expiryPreview').textContent,/تخمینی/);doc.querySelector('#editDays').value='0';doc.querySelector('#editDays').dispatchEvent(new dom.window.Event('input'));assert.equal(doc.querySelector('#expiryPreview').textContent,'بدون انقضا');doc.querySelector('#editDays').value='10';doc.querySelector('#editName').value='گوشی آزمایش';doc.querySelector('#modalForm').dispatchEvent(new dom.window.Event('submit',{bubbles:true,cancelable:true}));
   await wait(()=>doc.querySelectorAll('#deviceRows tr').length===2);
   const row=Array.from(doc.querySelectorAll('#deviceRows tr')).find(r=>r.textContent.includes('گوشی آزمایش'));assert.ok(row.querySelector('[role=progressbar]'));
-  row.querySelector('.link-button').click();await wait(()=>doc.querySelector('#link')?.value.startsWith('vless://'));
-  const link=doc.querySelector('#link').value;doc.querySelector('#modalCancel').click();
+  assert.match(row.querySelector('.meter-percent').textContent,/٪ مصرف‌شده/);assert.ok(row.querySelector('.qr-button'));await wait(()=>doc.querySelector('#link')?.value.startsWith('vless://'));
+  assert.ok(doc.querySelector('svg.qr-image'));const link=doc.querySelector('#link').value;doc.querySelector('#modalCancel').click();
   const baseline=dom.window.buildClientConfig(link,{port:10818,mux:false,fragment:false,concurrency:8});
   assert.equal(baseline.outbounds[0].mux.enabled,false);assert.equal(baseline.outbounds[0].streamSettings.tlsSettings.allowInsecure,false);assert.equal(baseline.inbounds[0].listen,'127.0.0.1');
   assert.throws(()=>dom.window.buildClientConfig(link,{port:10818,fragment:true,length:'bad',interval:'1-3'}));
   assert.equal(doc.querySelectorAll('#profiles .profile').length,3);
+  // Deterministic UI-only fixtures exercise known expiry and connected rows.
+  dom.window.eval(`state.devices=[{id:'fixture',name:'fixture',enabled:true,quota_bytes:1000,used_bytes:350,remaining_bytes:650,duration_days:10,first_seen:1800000000,expires_at:1800864000}];state.summary=[{device_id:'fixture',active_connections:1}];renderDevices();editModal(state.devices[0]);`);
+  assert.match(doc.querySelector('#expiryPreview').textContent,/انقضای دقیق/);
+  assert.ok(!doc.querySelector('#expiryPreview').textContent.includes('تخمینی'));
+  assert.ok(doc.querySelector('#onlineRows .qr-button'));
+  assert.equal(doc.querySelector('#deviceRows [role=progressbar]').getAttribute('aria-valuenow'),'35');
+  assert.match(doc.querySelector('#deviceRows .meter-percent').textContent,/۳۵٪ مصرف‌شده/);
+  doc.querySelector('#modalCancel').click();
+
   doc.querySelector('#tab-online').click();assert.equal(doc.querySelector('#tab-online').getAttribute('aria-selected'),'true');
   assert.equal(failures.length,0,failures.join('\n'));
   console.log('PASS: shipped JS + HTTP, login, modal device creation, progress, link, client JSON defaults/validation, online tab; no native dialogs');
