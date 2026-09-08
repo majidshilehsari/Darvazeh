@@ -2,13 +2,29 @@ import os, json, time, secrets, hashlib, hmac, subprocess, threading, collection
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
-DATA = Path(os.getenv('DATA_DIR', '/data')); DATA.mkdir(parents=True, exist_ok=True)
+DATA = Path(os.getenv('DATA_DIR', '/data'))
 PASSWORD = os.environ.get('ADMIN_PASSWORD', '')
 DOMAIN = os.environ.get('PUBLIC_DOMAIN', '').strip()
 DEMO = os.getenv('DEMO_MODE') == '1'
-if not DEMO and (len(PASSWORD) < 16 or not DOMAIN or '/' in DOMAIN or ':' in DOMAIN):
-    raise SystemExit('Set ADMIN_PASSWORD (16+ characters) and PUBLIC_DOMAIN (hostname only).')
-PASSWORD_HASH = hashlib.scrypt(PASSWORD.encode(), salt=b'darvazeh-admin-v1', n=16384, r=8, p=1)
+VERSION = '0.1.0-preview.2'
+ENV_ERRORS = []
+if not PASSWORD:
+    ENV_ERRORS.append('ADMIN_PASSWORD_MISSING')
+elif len(PASSWORD) < 16:
+    ENV_ERRORS.append('ADMIN_PASSWORD_TOO_SHORT')
+if not DOMAIN:
+    ENV_ERRORS.append('PUBLIC_DOMAIN_MISSING')
+elif '/' in DOMAIN or ':' in DOMAIN or any(c.isspace() for c in DOMAIN) or any(c in DOMAIN for c in '[]()='):
+    ENV_ERRORS.append('PUBLIC_DOMAIN_INVALID')
+PASSWORD_HASH = None
+if not any(e.startswith('ADMIN_PASSWORD') for e in ENV_ERRORS):
+    try:
+        PASSWORD_HASH = hashlib.scrypt(PASSWORD.encode(), salt=b'darvazeh-admin-v1', n=16384, r=8, p=1)
+    except (ValueError, MemoryError):
+        ENV_ERRORS.append('AUTH_INITIALIZATION_FAILED')
+STORAGE_ERROR = None
+CORE_ERROR = None
+INITIALIZING = True
 LOCK = threading.RLock(); SESSIONS = {}; ATTEMPTS = {}; EVENTS = collections.deque(maxlen=150)
 START = time.time(); PROC = None
 
@@ -19,10 +35,41 @@ def save(path, value):
     temp = path.with_suffix('.tmp'); temp.write_text(json.dumps(value, indent=2)); temp.chmod(0o600); temp.replace(path)
 
 SETTINGS = DATA / 'settings.json'
-if not SETTINGS.exists():
-    import uuid
-    save(SETTINGS, {'uuid': str(uuid.uuid4()), 'loglevel': 'warning'})
-settings = json.loads(SETTINGS.read_text())
+settings = None
+
+def load_settings():
+    global settings, STORAGE_ERROR
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        if SETTINGS.exists():
+            value = json.loads(SETTINGS.read_text())
+            import uuid
+            uuid.UUID(value['uuid'])
+            if value['loglevel'] not in ('warning', 'error', 'none'):
+                raise ValueError('Invalid log level')
+            settings = value
+        elif not ENV_ERRORS:
+            import uuid
+            value = {'uuid': str(uuid.uuid4()), 'loglevel': 'warning'}
+            save(SETTINGS, value)
+            settings = value
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        STORAGE_ERROR = 'STORAGE_UNAVAILABLE_OR_INVALID'
+        event('error', 'خواندن فضای داده ناموفق است؛ فایل موجود تغییر نکرد. Volume و مجوزها را بررسی کنید.')
+
+def bootstrap():
+    # Only non-secret setup codes are public. Never echo environment values.
+    return {'version': VERSION, 'login_enabled': PASSWORD_HASH is not None,
+            'errors': list(ENV_ERRORS), 'initializing': INITIALIZING}
+
+def record_core_error(exc):
+    global CORE_ERROR
+    if isinstance(exc, FileNotFoundError): CORE_ERROR = 'XRAY_NOT_FOUND'
+    elif isinstance(exc, subprocess.TimeoutExpired): CORE_ERROR = 'XRAY_VALIDATION_TIMEOUT'
+    elif isinstance(exc, subprocess.CalledProcessError): CORE_ERROR = 'XRAY_CONFIG_REJECTED'
+    elif isinstance(exc, OSError): CORE_ERROR = 'CORE_IO_ERROR'
+    else: CORE_ERROR = 'XRAY_START_FAILED'
+    event('error', CORE_ERROR)
 
 def config(s):
     return {'log': {'loglevel': s['loglevel'], 'access': 'none'},
@@ -40,8 +87,10 @@ def stop():
         except subprocess.TimeoutExpired: PROC.kill(); PROC.wait()
 
 def apply(s):
-    global PROC, settings
+    global PROC, settings, CORE_ERROR
     with LOCK:
+        if ENV_ERRORS or STORAGE_ERROR or settings is None:
+            raise RuntimeError('Setup not ready')
         if not DEMO:
             candidate = DATA / 'candidate.json'; save(candidate, config(s))
             subprocess.run(['xray', 'run', '-test', '-config', str(candidate)], check=True, timeout=15,
@@ -56,13 +105,15 @@ def apply(s):
                 save(DATA / 'xray.json', config(previous))
                 PROC = subprocess.Popen(['xray', 'run', '-config', str(DATA / 'xray.json')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 raise RuntimeError('Core failed to start; previous configuration restored')
-        settings = s; save(SETTINGS, s); event('configuration', 'تنظیمات هسته اعمال شد' if not DEMO else 'تنظیمات نمایشی ذخیره شد')
+        save(SETTINGS, s); settings = s; CORE_ERROR = None; event('configuration', 'تنظیمات هسته اعمال شد' if not DEMO else 'تنظیمات نمایشی ذخیره شد')
 
 def status():
     alive = bool(PROC and PROC.poll() is None)
     return {'mode': 'demo' if DEMO else 'live', 'core_running': alive, 'uptime_seconds': int(time.time()-START),
         'domain': DOMAIN, 'transport': 'VLESS / WebSocket', 'path': '/connect',
-        'tls': 'Hostim edge → HTTP داخلی', 'loglevel': settings['loglevel'],
+        'tls': 'Hostim edge → HTTP داخلی', 'loglevel': settings['loglevel'] if settings else 'warning',
+        'version': VERSION, 'initializing': INITIALIZING,
+        'setup_errors': list(ENV_ERRORS) + ([STORAGE_ERROR] if STORAGE_ERROR else []) + ([CORE_ERROR] if CORE_ERROR else []),
         'panel_memory_mb': round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024, 1),
         'events': list(EVENTS), 'limits': ['این گزارش دسترسی از همراه اول یا ایرانسل را آزمایش نمی‌کند.',
         'تعداد کاربران آنلاین و حجم ترافیک در این نسخه اندازه‌گیری نمی‌شود.', 'محتوای ترافیک، مقصدها و UUID در گزارش ثبت نمی‌شوند.']}
@@ -83,6 +134,7 @@ class Handler(BaseHTTPRequestHandler):
             return (sid,s) if s and s['expires'] > time.time() else (None,None)
         except Exception: return None,None
     def do_GET(self):
+        if self.path == '/api/bootstrap': return self.reply(200, bootstrap())
         if self.path == '/healthz': return self.reply(200, {'panel': 'ok'})
         if self.path == '/':
             raw = Path(__file__).with_name('index.html').read_bytes()
@@ -97,6 +149,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/api/status': result['csrf'] = s['csrf']
             return self.reply(200,result, {'Content-Disposition':'attachment; filename="darvazeh-report.json"'} if self.path.endswith('report') else {})
         if self.path == '/api/link':
+            if INITIALIZING or ENV_ERRORS or STORAGE_ERROR or settings is None or (not DEMO and not (PROC and PROC.poll() is None)):
+                return self.reply(503, {'error':'لینک آماده نیست؛ خطاهای راه‌اندازی پنل را بررسی کنید'})
             q = urllib.parse.urlencode({'encryption':'none','security':'tls','sni':DOMAIN,'type':'ws','host':DOMAIN,'path':'/connect','fp':'chrome'})
             return self.reply(200, {'link': f"vless://{settings['uuid']}@{DOMAIN}:443?{q}#Darvazeh"})
         return self.reply(404, {'error':'یافت نشد'})
@@ -112,6 +166,8 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body,dict): raise ValueError()
         except Exception: return self.reply(400, {'error':'درخواست نامعتبر'})
         if self.path == '/api/login':
+            if PASSWORD_HASH is None:
+                return self.reply(503, {'error':'ورود امن آماده نیست؛ ADMIN_PASSWORD را در Hostim اصلاح و اپ را Restart کنید'})
             # Nginx is the only production peer. A global limiter avoids trusting spoofable headers.
             now = time.time()
             with LOCK:
@@ -134,6 +190,8 @@ class Handler(BaseHTTPRequestHandler):
         if not hmac.compare_digest(self.headers.get('X-CSRF-Token',''),s['csrf']): return self.reply(403, {'error':'CSRF rejected'})
         if self.path == '/api/logout':
             SESSIONS.pop(sid,None); return self.reply(200,{}, {'Set-Cookie':'session=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict'})
+        if self.path != '/api/logout' and (INITIALIZING or ENV_ERRORS or STORAGE_ERROR or settings is None):
+            return self.reply(503, {'error':'ابتدا خطاهای راه‌اندازی را برطرف کنید؛ داده‌ها تغییر نکردند'})
         try:
             with LOCK:
                 if self.path == '/api/settings':
@@ -146,13 +204,24 @@ class Handler(BaseHTTPRequestHandler):
                     apply({**settings,'uuid':str(uuid.uuid4())})
                 else: return self.reply(404, {'error':'یافت نشد'})
             return self.reply(200, {'ok':True})
-        except Exception:
-            event('error','اعمال تنظیمات ناموفق بود؛ وضعیت هسته را بررسی کنید')
+        except Exception as exc:
+            record_core_error(exc)
             return self.reply(500, {'error':'عملیات ناموفق بود؛ تنظیم قبلی تا حد امکان حفظ شد'})
 
 if __name__ == '__main__':
-    try: apply(settings.copy())
-    except Exception: event('error','راه‌اندازی اولیه هسته ناموفق بود')
+    def initialize():
+        global INITIALIZING
+        try:
+            for code in ENV_ERRORS:
+                print('Setup:', code, flush=True)
+                event('setup', code)
+            load_settings()
+            if not ENV_ERRORS and not STORAGE_ERROR and settings is not None:
+                try: apply(settings.copy())
+                except Exception as exc: record_core_error(exc)
+        finally:
+            INITIALIZING = False
+    threading.Thread(target=initialize, daemon=True).start()
     def watch():
         previous = None
         while True:
