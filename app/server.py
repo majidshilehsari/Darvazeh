@@ -72,6 +72,10 @@ def bootstrap():
 
 def record_core_error(exc):
     global CORE_ERROR
+    # A dropped client connection (BrokenPipe/Reset) is an OSError but has nothing to
+    # do with the core or the volume. Reporting it as CORE_IO_ERROR sent operators
+    # hunting a disk fault that did not exist, while the core was running normally.
+    if isinstance(exc, ConnectionError): return
     if isinstance(exc, FileNotFoundError): CORE_ERROR = 'XRAY_NOT_FOUND'
     elif isinstance(exc, subprocess.TimeoutExpired): CORE_ERROR = 'XRAY_VALIDATION_TIMEOUT'
     elif isinstance(exc, subprocess.CalledProcessError): CORE_ERROR = 'XRAY_CONFIG_REJECTED'
@@ -85,6 +89,17 @@ def device_records(value=None):
     return [{'id':'legacy', 'name':value.get('legacy_name','اتصال قبلی'),
              'uuid':value['uuid'], 'enabled':value.get('legacy_enabled',True), 'legacy':True,
              'quota_bytes':value.get('legacy_quota_bytes',0),'duration_days':value.get('legacy_duration_days',0)}] + value.get('devices',[])
+
+def clean_name(value):
+    if not isinstance(value, str): return None
+    value = value.strip()
+    if not 1 <= len(value) <= 80 or any(ord(c) < 32 for c in value): return None
+    return value
+
+def make_device(name, limits):
+    import uuid
+    return {'id':uuid.uuid4().hex,'uuid':str(uuid.uuid4()),'name':name.strip(),'enabled':True,
+            'quota_bytes':limits.get('quota_bytes',0),'duration_days':limits.get('duration_days',0)}
 
 def validate_devices(value):
     import uuid
@@ -219,10 +234,15 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def reply(self, code, value, headers=None):
         raw = json.dumps(value, ensure_ascii=False).encode()
-        self.send_response(code); self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Cache-Control', 'no-store'); self.send_header('X-Content-Type-Options', 'nosniff')
-        for k,v in (headers or {}).items(): self.send_header(k,v)
-        self.end_headers(); self.wfile.write(raw)
+        try:
+            self.send_response(code); self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store'); self.send_header('X-Content-Type-Options', 'nosniff')
+            for k,v in (headers or {}).items(): self.send_header(k,v)
+            self.end_headers(); self.wfile.write(raw)
+        except ConnectionError:
+            # Client navigated away or the proxy closed the socket first. Nothing to
+            # report upward: the operation itself already completed successfully.
+            pass
     def session(self):
         from http.cookies import SimpleCookie
         try:
@@ -324,12 +344,68 @@ class Handler(BaseHTTPRequestHandler):
                         return self.reply(409, {'error':'ساخت دستگاه محدود نیازمند پایش روشن و دیتابیس سالم است'})
                     new.setdefault('devices',[]).append({'id':uuid.uuid4().hex,'uuid':str(uuid.uuid4()),'name':name.strip(),'enabled':True,**limits})
                     apply(new)
+                elif self.path == '/api/devices/bulk':
+                    ids=body.get('ids'); operation=body.get('operation')
+                    if operation not in ('delete','enable','disable'):
+                        return self.reply(400, {'error':'عملیات دسته‌ای نامعتبر است'})
+                    if not isinstance(ids,list) or not ids or len(ids)>50 or not all(isinstance(x,str) for x in ids):
+                        return self.reply(400, {'error':'فهرست دستگاه‌های انتخاب‌شده نامعتبر است'})
+                    wanted=set(ids)
+                    if operation=='delete' and 'legacy' in wanted:
+                        return self.reply(400, {'error':'دستگاه «اتصال قبلی» در حذف دسته‌ای مجاز نیست؛ ابتدا آن را از انتخاب خارج کنید.'})
+                    new=json.loads(json.dumps(settings))
+                    known={d['id'] for d in device_records(new)}
+                    if wanted-known:
+                        return self.reply(400, {'error':'فهرست شامل شناسهٔ ناشناخته است؛ صفحه را به‌روز کنید'})
+                    if operation=='delete':
+                        new['devices']=[item for item in new.get('devices',[]) if item['id'] not in wanted]
+                    else:
+                        for d in device_records(new):
+                            if d['id'] not in wanted: continue
+                            if d['id']=='legacy': new['legacy_enabled']= operation=='enable'
+                            else: d['enabled']= operation=='enable'
+                    apply(new)
+                    return self.reply(200, {'ok':True,'affected':len(wanted)})
+                elif self.path == '/api/devices/import':
+                    items=body.get('devices')
+                    if not isinstance(items,list) or not items:
+                        return self.reply(400, {'error':'فهرست دستگاه‌ها خالی است'})
+                    if len(items)>50:
+                        return self.reply(400, {'error':'هر بار حداکثر ۵۰ دستگاه می‌توانید اضافه کنید'})
+                    new=json.loads(json.dumps(settings))
+                    free=50-len(device_records(new))
+                    if len(items)>free:
+                        return self.reply(400, {'error':f'ظرفیت باقی‌مانده {free} دستگاه است؛ تعداد را کم کنید'})
+                    prepared=[]
+                    for index,item in enumerate(items):
+                        if not isinstance(item,dict):
+                            return self.reply(400, {'error':f'ردیف {index+1} نامعتبر است'})
+                        name=clean_name(item.get('name'))
+                        if name is None:
+                            return self.reply(400, {'error':f'ردیف {index+1}: نام باید بین ۱ تا ۸۰ کاراکتر و بدون کاراکتر کنترلی باشد'})
+                        limits={'quota_bytes':item.get('quota_bytes',0),'duration_days':item.get('duration_days',0)}
+                        try: validate_limits(limits)
+                        except ValueError:
+                            return self.reply(400, {'error':f'ردیف {index+1}: سقف حجم یا مدت اعتبار نامعتبر است'})
+                        if constrained(limits) and (not MONITOR_ENABLED or HISTORY is None):
+                            return self.reply(409, {'error':'ساخت دستگاه محدود نیازمند پایش روشن و دیتابیس سالم است'})
+                        prepared.append((name,limits))
+                    for name,limits in prepared:
+                        new.setdefault('devices',[]).append(make_device(name,limits))
+                    apply(new)
+                    return self.reply(200, {'ok':True,'created':len(prepared)})
                 elif self.path == '/api/device':
                     ident=body.get('id'); operation=body.get('operation')
                     new=json.loads(json.dumps(settings))
                     d=next((d for d in device_records(new) if d['id']==ident),None)
-                    if not d or operation not in ('enable','disable','rename','rotate','edit'):
+                    if not d or operation not in ('enable','disable','rename','rotate','edit','delete'):
                         return self.reply(400, {'error':'عملیات یا دستگاه نامعتبر'})
+                    if operation=='delete':
+                        if ident=='legacy':
+                            return self.reply(400, {'error':'دستگاه «اتصال قبلی» حذف نمی‌شود؛ کلید اصلی همین فایل است. آن را غیرفعال کنید یا کلیدش را تعویض کنید.'})
+                        new['devices']=[item for item in new.get('devices',[]) if item['id']!=ident]
+                        apply(new)
+                        return self.reply(200, {'ok':True,'deleted':1})
                     if operation in ('rename','edit'):
                         name=body.get('name','')
                         if not isinstance(name,str) or not 1<=len(name.strip())<=80 or any(ord(c)<32 for c in name):
